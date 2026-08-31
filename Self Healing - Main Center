@@ -1,0 +1,208 @@
+#include <SPI.h>
+#include <LoRa.h>
+
+#define NODE_ID "MAIN"
+
+#define LORA_SCK   14
+#define LORA_MISO  12
+#define LORA_MOSI  13
+#define LORA_SS    15
+#define LORA_RST   17
+#define LORA_DIO0  4
+
+#define LORA_BAND 865E6
+
+
+String getField(String message, String field) {
+
+  int start = message.indexOf(field);
+
+  if (start == -1) return "";
+
+  start += field.length();
+
+  int end = message.indexOf("|", start);
+
+  if (end == -1) end = message.length();
+
+  return message.substring(start, end);
+}
+
+
+void setupLoRa() {
+
+  SPI.begin(
+    LORA_SCK,
+    LORA_MISO,
+    LORA_MOSI,
+    LORA_SS
+  );
+
+  LoRa.setPins(
+    LORA_SS,
+    LORA_RST,
+    LORA_DIO0
+  );
+
+  if (!LoRa.begin(LORA_BAND)) {
+
+    Serial.println("MAIN LoRa FAILED!");
+
+    while (true);
+  }
+
+  LoRa.setSpreadingFactor(7);
+  LoRa.setSignalBandwidth(125E3);
+  LoRa.setCodingRate4(5);
+  LoRa.setSyncWord(0x12);
+  LoRa.enableCrc();
+
+  LoRa.receive();
+
+  Serial.println("MAIN READY");
+}
+
+
+void sendACK(
+  String destination,
+  String packetID
+) {
+
+  String ack =
+    "ACK|FROM:MAIN|TO:" +
+    destination +
+    "|ID:" +
+    packetID;
+
+
+  LoRa.idle();
+
+  LoRa.beginPacket();
+  LoRa.print(ack);
+  LoRa.endPacket();
+
+  LoRa.receive();
+
+
+  Serial.print("ACK SENT TO: ");
+  Serial.println(destination);
+}
+
+
+void receiveData() {
+
+  int packetSize =
+    LoRa.parsePacket();
+
+  if (!packetSize) return;
+
+
+  String received = "";
+
+  while (
+    LoRa.available()
+  ) {
+
+    received +=
+      (char)LoRa.read();
+  }
+
+
+  if (
+    !received.startsWith("DATA")
+  ) {
+
+    return;
+  }
+
+
+  String destination =
+    getField(
+      received,
+      "DEST:"
+    );
+
+
+  if (
+    destination != "MAIN"
+  ) {
+
+    return;
+  }
+
+
+  String source =
+    getField(
+      received,
+      "SRC:"
+    );
+
+  String sender =
+    getField(
+      received,
+      "FROM:"
+    );
+
+  String packetID =
+    getField(
+      received,
+      "ID:"
+    );
+
+  String payload =
+    getField(
+      received,
+      "MSG:"
+    );
+
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("DATA RECEIVED AT MAIN");
+
+  Serial.print("ORIGINAL SOURCE: ");
+  Serial.println(source);
+
+  Serial.print("CURRENT SENDER: ");
+  Serial.println(sender);
+
+  Serial.print("PACKET ID: ");
+  Serial.println(packetID);
+
+  Serial.print("MESSAGE: ");
+  Serial.println(payload);
+
+  Serial.print("RSSI: ");
+  Serial.print(LoRa.packetRssi());
+  Serial.println(" dBm");
+
+  Serial.println("================================");
+
+
+  // ACK THE NODE THAT ACTUALLY TRANSMITTED
+
+  sendACK(
+    sender,
+    packetID
+  );
+}
+
+
+void setup() {
+
+  Serial.begin(115200);
+
+  delay(2000);
+
+  Serial.println("RESQMESH MAIN CENTER");
+
+  setupLoRa();
+}
+
+
+void loop() {
+
+  receiveData();
+
+  delay(10);
+}
