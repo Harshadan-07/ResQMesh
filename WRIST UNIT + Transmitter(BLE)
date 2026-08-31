@@ -1,0 +1,299 @@
+#include <Wire.h>
+#include "MAX30105.h"
+#include "spo2_algorithm.h"
+#include "BluetoothSerial.h"
+
+MAX30105 sensor;
+BluetoothSerial SerialBT;
+
+// ======================================================
+// BLUETOOTH CONFIGURATION
+// ======================================================
+const char* HELMET_NAME = "HELMET_UNIT";
+bool bluetoothConnected = false;
+
+// ======================================================
+// MAX30102 SENSOR BUFFERS
+// ======================================================
+#define BUFFER_SIZE 100
+#define FINGER_THRESHOLD 50000
+
+uint32_t irBuffer[BUFFER_SIZE];
+uint32_t redBuffer[BUFFER_SIZE];
+
+int32_t spo2;
+int8_t validSPO2;
+
+int32_t heartRate;
+int8_t validHeartRate;
+
+bool initialBufferFilled = false;
+
+// ======================================================
+// SMOOTHING & OUTLIER FILTERING
+// ======================================================
+#define BPM_AVERAGE_COUNT 5
+float bpmValues[BPM_AVERAGE_COUNT];
+int bpmCount = 0;
+int bpmIndex = 0;
+float averageBPM = 0;
+
+#define SPO2_AVERAGE_COUNT 5
+float spo2Values[SPO2_AVERAGE_COUNT];
+int spo2Count = 0;
+int spo2Index = 0;
+float averageSpO2 = 0;
+
+// ======================================================
+// FILTER & AVERAGE FUNCTIONS
+// ======================================================
+
+float calculateBPMAverage() {
+  if (bpmCount == 0) return 0;
+  float total = 0;
+  for (int i = 0; i < bpmCount; i++) {
+    total += bpmValues[i];
+  }
+  return total / bpmCount;
+}
+
+float calculateSpO2Average() {
+  if (spo2Count == 0) return 0;
+  float total = 0;
+  for (int i = 0; i < spo2Count; i++) {
+    total += spo2Values[i];
+  }
+  return total / spo2Count;
+}
+
+void addBPM(float value) {
+  // Outlier filter: If we already have readings, ignore sudden wild jumps (>15 BPM in 1 sec)
+  if (bpmCount >= 2 && averageBPM > 0) {
+    if (abs(value - averageBPM) > 15.0) {
+      // Slew-rate limit: nudge towards new reading gently instead of jumping
+      if (value > averageBPM) value = averageBPM + 3.0;
+      else value = averageBPM - 3.0;
+    }
+  }
+
+  bpmValues[bpmIndex] = value;
+  bpmIndex = (bpmIndex + 1) % BPM_AVERAGE_COUNT;
+  if (bpmCount < BPM_AVERAGE_COUNT) bpmCount++;
+
+  averageBPM = calculateBPMAverage();
+}
+
+void addSpO2(float value) {
+  // Outlier filter: Normal human SpO2 doesn't jump rapidly
+  if (spo2Count >= 2 && averageSpO2 > 0) {
+    if (abs(value - averageSpO2) > 3.0) {
+      if (value > averageSpO2) value = averageSpO2 + 1.0;
+      else value = averageSpO2 - 1.0;
+    }
+  }
+
+  spo2Values[spo2Index] = value;
+  spo2Index = (spo2Index + 1) % SPO2_AVERAGE_COUNT;
+  if (spo2Count < SPO2_AVERAGE_COUNT) spo2Count++;
+
+  averageSpO2 = calculateSpO2Average();
+}
+
+void resetAverages() {
+  bpmCount = 0;
+  bpmIndex = 0;
+  spo2Count = 0;
+  spo2Index = 0;
+  averageBPM = 0;
+  averageSpO2 = 0;
+  initialBufferFilled = false;
+}
+
+// ======================================================
+// BLUETOOTH CONNECTION
+// ======================================================
+void connectToHelmet() {
+  Serial.println();
+  Serial.println("Connecting to HELMET_UNIT...");
+
+  if (SerialBT.connect(HELMET_NAME)) {
+    bluetoothConnected = true;
+    Serial.println("Bluetooth : CONNECTED");
+  } else {
+    bluetoothConnected = false;
+    Serial.println("Bluetooth : CONNECTION FAILED");
+  }
+}
+
+// ======================================================
+// SETUP
+// ======================================================
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22);
+
+  // Initialize Bluetooth Master
+  if (!SerialBT.begin("WRIST_UNIT", true)) {
+    Serial.println("Bluetooth initialization FAILED!");
+    while (1);
+  }
+
+  // Initialize MAX30102 Sensor
+  if (!sensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("MAX30102 NOT FOUND!");
+    while (1);
+  }
+
+  // Optimal settings for human finger pulse & oxygen detection
+  byte ledBrightness = 60;  // 0 = Off, 255 = 50mA
+  byte sampleAverage = 4;   // Average 4 samples per read
+  byte ledMode       = 2;   // Red + IR
+  byte sampleRate    = 100; // 100 samples/sec
+  int pulseWidth     = 411; // 411us pulse width (18-bit resolution)
+  int adcRange       = 4096;
+
+  sensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
+  sensor.setPulseAmplitudeRed(0x3F);
+  sensor.setPulseAmplitudeIR(0x3F);
+  sensor.setPulseAmplitudeGreen(0);
+
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("             RESQ-MESH                  ");
+  Serial.println("             WRIST UNIT                 ");
+  Serial.println("========================================");
+  Serial.println("MAX30102 : READY");
+  Serial.println();
+  Serial.println("PLACE YOUR FINGER");
+  Serial.println("Waiting for sensor contact...");
+
+  delay(1500);
+  connectToHelmet();
+}
+
+// ======================================================
+// LOOP
+// ======================================================
+void loop() {
+  // 1. Bluetooth Reconnection
+  if (!SerialBT.connected()) {
+    bluetoothConnected = false;
+    Serial.println("Bluetooth disconnected.");
+    delay(1000);
+    connectToHelmet();
+  } else {
+    bluetoothConnected = true;
+  }
+
+  // 2. Check Sensor Contact
+  sensor.check();
+  long IR = sensor.getIR();
+
+  if (IR < FINGER_THRESHOLD) {
+    Serial.println();
+    Serial.println("PLACE YOUR FINGER");
+    Serial.println("Sensor contact missing.");
+
+    resetAverages();
+
+    if (bluetoothConnected) {
+      SerialBT.print("NO_CONTACT\n");
+      Serial.println("Bluetooth TX        : NO_CONTACT");
+    }
+
+    delay(500);
+    return;
+  }
+
+  // 3. Fill Initial 100 Samples on First Finger Contact (~4s)
+  if (!initialBufferFilled) {
+    Serial.println("Calibrating initial 100 samples...");
+    for (int i = 0; i < BUFFER_SIZE; i++) {
+      while (!sensor.available()) {
+        sensor.check();
+      }
+      redBuffer[i] = sensor.getRed();
+      irBuffer[i]  = sensor.getIR();
+      sensor.nextSample();
+    }
+    initialBufferFilled = true;
+  } else {
+    // 4. Sliding Window: Shift 25 samples & collect 25 new samples (~1s)
+    for (int i = 25; i < BUFFER_SIZE; i++) {
+      redBuffer[i - 25] = redBuffer[i];
+      irBuffer[i - 25]  = irBuffer[i];
+    }
+
+    for (int i = 75; i < BUFFER_SIZE; i++) {
+      while (!sensor.available()) {
+        sensor.check();
+      }
+      redBuffer[i] = sensor.getRed();
+      irBuffer[i]  = sensor.getIR();
+      sensor.nextSample();
+    }
+  }
+
+  // 5. Calculate Values with Maxim Algorithm
+  maxim_heart_rate_and_oxygen_saturation(
+    irBuffer,
+    BUFFER_SIZE,
+    redBuffer,
+    &spo2,
+    &validSPO2,
+    &heartRate,
+    &validHeartRate
+  );
+
+  // 6. Realistic Human Range Filter (prevents false spikes)
+  // Normal resting human BPM: 55 to 130
+  if (validHeartRate && heartRate >= 55 && heartRate <= 130) {
+    addBPM((float)heartRate);
+  }
+
+  // Normal human SpO2: 94% to 100%
+  if (validSPO2 && spo2 >= 90 && spo2 <= 100) {
+    // Standard calibration offset if sensor reads slightly low
+    float cleanSpo2 = (spo2 < 95) ? (float)spo2 + 2.0 : (float)spo2;
+    if (cleanSpo2 > 100.0) cleanSpo2 = 99.0;
+    addSpO2(cleanSpo2);
+  }
+
+  // 7. Display on Serial Monitor
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("             WRIST HEALTH               ");
+  Serial.println("========================================");
+
+  if (bpmCount > 0 && averageBPM > 0) {
+    Serial.print("Heart Rate           : ");
+    Serial.print((int)round(averageBPM));
+    Serial.println(" BPM");
+  } else {
+    Serial.println("Heart Rate           : -- BPM");
+  }
+
+  if (spo2Count > 0 && averageSpO2 > 0) {
+    Serial.print("SpO2                 : ");
+    Serial.print((int)round(averageSpO2));
+    Serial.println(" %");
+  } else {
+    Serial.println("SpO2                 : -- %");
+  }
+
+  Serial.println("========================================");
+
+  // 8. Bluetooth Transmission to Helmet Unit
+  if (bluetoothConnected && bpmCount > 0 && spo2Count > 0) {
+    String packet = String((int)round(averageBPM)) + "," + 
+                    String((int)round(averageSpO2)) + "\n";
+
+    SerialBT.print(packet);
+
+    Serial.print("Bluetooth TX        : ");
+    Serial.print((int)round(averageBPM));
+    Serial.print(" BPM, ");
+    Serial.print((int)round(averageSpO2));
+    Serial.println(" %");
+  }
+}
