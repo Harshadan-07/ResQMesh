@@ -1,0 +1,624 @@
+#include <SPI.h>
+#include <LoRa.h>
+
+// =====================================================
+// RESQMESH
+// P1 PERMANENT BRIDGE NODE
+//
+// P1 ONLY:
+// RECEIVE -> STORE -> ACK -> FORWARD TO MAIN
+//
+// NO OWN MESSAGE GENERATION
+// =====================================================
+
+// ---------------- NODE ID ----------------
+#define NODE_ID "P1"
+
+// ---------------- LORA PINS ----------------
+// ETS IoT-WDM board configuration
+#define LORA_SCK   14
+#define LORA_MISO  12
+#define LORA_MOSI  13
+#define LORA_SS    15
+#define LORA_RST   17
+#define LORA_DIO0  4
+
+#define LORA_BAND 865E6
+
+// ---------------- SETTINGS ----------------
+#define ACK_TIMEOUT       3000
+#define MAX_RETRIES       3
+#define FORWARD_INTERVAL  5000
+
+unsigned long lastForwardTime = 0;
+
+
+// =====================================================
+// PACKET QUEUE
+// =====================================================
+
+#define MAX_QUEUE 20
+
+struct Packet {
+  String source;
+  String packetID;
+  String payload;
+};
+
+Packet packetQueue[MAX_QUEUE];
+
+int queueCount = 0;
+
+
+// =====================================================
+// GET FIELD FROM PACKET
+// Example:
+// DATA|SRC:W1|FROM:W1|DEST:P1|ID:W1_1|MSG:HELLO
+// =====================================================
+
+String getField(String message, String field) {
+
+  int start = message.indexOf(field);
+
+  if (start == -1) {
+    return "";
+  }
+
+  start += field.length();
+
+  int end = message.indexOf("|", start);
+
+  if (end == -1) {
+    end = message.length();
+  }
+
+  return message.substring(start, end);
+}
+
+
+// =====================================================
+// CHECK IF PACKET ALREADY EXISTS
+// =====================================================
+
+bool packetAlreadyStored(
+  String source,
+  String packetID
+) {
+
+  for (int i = 0; i < queueCount; i++) {
+
+    if (
+      packetQueue[i].source == source &&
+      packetQueue[i].packetID == packetID
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+
+// =====================================================
+// STORE PACKET
+// =====================================================
+
+bool storePacket(
+  String source,
+  String packetID,
+  String payload
+) {
+
+  // Duplicate packet
+  if (packetAlreadyStored(source, packetID)) {
+
+    Serial.println("DUPLICATE PACKET - ALREADY STORED");
+
+    return true;
+  }
+
+
+  // Queue full
+  if (queueCount >= MAX_QUEUE) {
+
+    Serial.println("P1 QUEUE FULL!");
+
+    return false;
+  }
+
+
+  // Store packet
+  packetQueue[queueCount].source = source;
+  packetQueue[queueCount].packetID = packetID;
+  packetQueue[queueCount].payload = payload;
+
+  queueCount++;
+
+
+  Serial.println();
+  Serial.println("PACKET STORED SUCCESSFULLY");
+
+  Serial.print("QUEUE SIZE: ");
+  Serial.println(queueCount);
+
+
+  return true;
+}
+
+
+// =====================================================
+// REMOVE FIRST PACKET FROM QUEUE
+// =====================================================
+
+void removeFirstPacket() {
+
+  if (queueCount == 0) {
+    return;
+  }
+
+
+  for (
+    int i = 0;
+    i < queueCount - 1;
+    i++
+  ) {
+
+    packetQueue[i] =
+      packetQueue[i + 1];
+  }
+
+
+  queueCount--;
+
+
+  Serial.print("PACKET REMOVED. QUEUE SIZE: ");
+  Serial.println(queueCount);
+}
+
+
+// =====================================================
+// LORA SETUP
+// =====================================================
+
+void setupLoRa() {
+
+  SPI.begin(
+    LORA_SCK,
+    LORA_MISO,
+    LORA_MOSI,
+    LORA_SS
+  );
+
+
+  LoRa.setPins(
+    LORA_SS,
+    LORA_RST,
+    LORA_DIO0
+  );
+
+
+  if (!LoRa.begin(LORA_BAND)) {
+
+    Serial.println("P1 LoRa FAILED!");
+
+    while (true) {
+      delay(1000);
+    }
+  }
+
+
+  LoRa.setSpreadingFactor(7);
+
+  LoRa.setSignalBandwidth(125E3);
+
+  LoRa.setCodingRate4(5);
+
+  LoRa.setSyncWord(0x12);
+
+  LoRa.enableCrc();
+
+  LoRa.receive();
+
+
+  Serial.println("P1 LoRa READY");
+}
+
+
+// =====================================================
+// SEND RAW PACKET
+// =====================================================
+
+void sendRawPacket(String packet) {
+
+  LoRa.idle();
+
+  LoRa.beginPacket();
+
+  LoRa.print(packet);
+
+  LoRa.endPacket();
+
+  LoRa.receive();
+}
+
+
+// =====================================================
+// SEND ACK
+// =====================================================
+
+void sendACK(
+  String destination,
+  String packetID
+) {
+
+  String ack =
+    "ACK|FROM:" +
+    String(NODE_ID) +
+    "|TO:" +
+    destination +
+    "|ID:" +
+    packetID;
+
+
+  Serial.print("SENDING ACK TO: ");
+  Serial.println(destination);
+
+
+  sendRawPacket(ack);
+}
+
+
+// =====================================================
+// PROCESS DATA PACKET FOR P1
+// =====================================================
+
+void processIncomingData(String received) {
+
+  if (!received.startsWith("DATA")) {
+    return;
+  }
+
+
+  String destination =
+    getField(received, "DEST:");
+
+
+  // Packet is not for P1
+  if (destination != NODE_ID) {
+    return;
+  }
+
+
+  String source =
+    getField(received, "SRC:");
+
+  String sender =
+    getField(received, "FROM:");
+
+  String packetID =
+    getField(received, "ID:");
+
+  String payload =
+    getField(received, "MSG:");
+
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("P1 RECEIVED PACKET");
+
+  Serial.print("ORIGINAL SOURCE: ");
+  Serial.println(source);
+
+  Serial.print("CURRENT SENDER: ");
+  Serial.println(sender);
+
+  Serial.print("PACKET ID: ");
+  Serial.println(packetID);
+
+  Serial.print("MESSAGE: ");
+  Serial.println(payload);
+
+  Serial.println("================================");
+
+
+  // Store packet first
+  bool stored =
+    storePacket(
+      source,
+      packetID,
+      payload
+    );
+
+
+  // ACK only after successful storage
+  if (stored) {
+
+    sendACK(
+      sender,
+      packetID
+    );
+  }
+}
+
+
+// =====================================================
+// WAIT FOR ACK FROM MAIN
+//
+// P1 CAN STILL RECEIVE NEW WORKER PACKETS
+// =====================================================
+
+bool waitForMainACK(
+  String expectedPacketID
+) {
+
+  unsigned long startTime =
+    millis();
+
+
+  while (
+    millis() - startTime <
+    ACK_TIMEOUT
+  ) {
+
+    int packetSize =
+      LoRa.parsePacket();
+
+
+    if (!packetSize) {
+
+      delay(5);
+
+      continue;
+    }
+
+
+    String received = "";
+
+
+    while (LoRa.available()) {
+
+      received +=
+        (char)LoRa.read();
+    }
+
+
+    // =================================================
+    // CHECK ACK
+    // =================================================
+
+    if (received.startsWith("ACK")) {
+
+      String from =
+        getField(
+          received,
+          "FROM:"
+        );
+
+      String to =
+        getField(
+          received,
+          "TO:"
+        );
+
+      String packetID =
+        getField(
+          received,
+          "ID:"
+        );
+
+
+      if (
+        from == "MAIN" &&
+        to == NODE_ID &&
+        packetID == expectedPacketID
+      ) {
+
+        Serial.println();
+        Serial.println("================================");
+        Serial.println("MAIN ACK RECEIVED");
+        Serial.println("FORWARD SUCCESS");
+        Serial.println("================================");
+
+        return true;
+      }
+    }
+
+
+    // =================================================
+    // NEW DATA ARRIVED WHILE WAITING
+    // =================================================
+
+    else if (received.startsWith("DATA")) {
+
+      processIncomingData(received);
+    }
+  }
+
+
+  return false;
+}
+
+
+// =====================================================
+// FORWARD FIRST QUEUED PACKET TO MAIN
+// =====================================================
+
+void forwardPacketToMain() {
+
+  if (queueCount == 0) {
+    return;
+  }
+
+
+  String source =
+    packetQueue[0].source;
+
+  String packetID =
+    packetQueue[0].packetID;
+
+  String payload =
+    packetQueue[0].payload;
+
+
+  // =================================================
+  // CORRECT PACKET FORMAT
+  // =================================================
+
+  String forwardPacket =
+    "DATA|SRC:" +
+    source +
+    "|FROM:" +
+    String(NODE_ID) +
+    "|DEST:MAIN|ID:" +
+    packetID +
+    "|MSG:" +
+    payload;
+
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("P1 FORWARDING PACKET TO MAIN");
+
+  Serial.print("ORIGINAL SOURCE: ");
+  Serial.println(source);
+
+  Serial.print("PACKET ID: ");
+  Serial.println(packetID);
+
+  Serial.print("QUEUE SIZE: ");
+  Serial.println(queueCount);
+
+  Serial.println("================================");
+
+
+  // =================================================
+  // RETRY FORWARDING
+  // =================================================
+
+  for (
+    int attempt = 1;
+    attempt <= MAX_RETRIES;
+    attempt++
+  ) {
+
+    Serial.print("FORWARD ATTEMPT ");
+    Serial.print(attempt);
+    Serial.print("/");
+    Serial.println(MAX_RETRIES);
+
+
+    sendRawPacket(forwardPacket);
+
+
+    Serial.println("WAITING FOR MAIN ACK...");
+
+
+    if (
+      waitForMainACK(packetID)
+    ) {
+
+      // Remove only after MAIN ACK
+      removeFirstPacket();
+
+      return;
+    }
+
+
+    Serial.println("NO ACK FROM MAIN");
+
+    delay(300);
+  }
+
+
+  // Keep packet for future retry
+  Serial.println();
+
+  Serial.println("MAIN UNREACHABLE");
+  Serial.println("PACKET KEPT IN P1 QUEUE");
+}
+
+
+// =====================================================
+// CHECK INCOMING PACKETS
+// =====================================================
+
+void checkIncoming() {
+
+  int packetSize =
+    LoRa.parsePacket();
+
+
+  if (!packetSize) {
+    return;
+  }
+
+
+  String received = "";
+
+
+  while (LoRa.available()) {
+
+    received +=
+      (char)LoRa.read();
+  }
+
+
+  if (received.startsWith("DATA")) {
+
+    processIncomingData(received);
+  }
+}
+
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  delay(2000);
+
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("RESQMESH PERMANENT NODE");
+  Serial.println("NODE ID: P1");
+  Serial.println("MODE: BRIDGE ONLY");
+  Serial.println("================================");
+
+
+  setupLoRa();
+
+
+  Serial.println();
+  Serial.println("P1 READY TO RECEIVE");
+}
+
+
+// =====================================================
+// MAIN LOOP
+// =====================================================
+
+void loop() {
+
+  // Always listen for worker packets
+  checkIncoming();
+
+
+  // Try forwarding stored packets periodically
+  if (
+    millis() - lastForwardTime >=
+    FORWARD_INTERVAL
+  ) {
+
+    lastForwardTime =
+      millis();
+
+    forwardPacketToMain();
+  }
+
+
+  delay(10);
+}
